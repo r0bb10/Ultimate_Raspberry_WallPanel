@@ -19,7 +19,7 @@ CONFIG_FILE="$SCRIPT_DIR/.kiosk-config"
 # --- Check Root ---
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root (sudo ./wallpanel_setup.sh)"
-  exit
+  exit 1
 fi
 
 # --- Get Real User ---
@@ -43,26 +43,53 @@ else
 fi
 CURRENT_HOSTNAME=$(cat /etc/hostname)
 
+# Detect connected display output (works on any SBC)
+detect_display_output() {
+    # Try to find a connected display from DRM subsystem
+    for status_file in /sys/class/drm/card*-*/status; do
+        if [ -f "$status_file" ] && grep -q "^connected$" "$status_file" 2>/dev/null; then
+            # Extract output name (e.g., HDMI-A-1, DP-1, DSI-1)
+            echo "$status_file" | sed 's|.*/card[0-9]-||;s|/status||'
+            return
+        fi
+    done
+    # Fallback to HDMI-A-1 if detection fails
+    echo "HDMI-A-1"
+}
+DISPLAY_OUTPUT=$(detect_display_output)
+
+# Detect if running on Raspberry Pi
+is_raspberry_pi() {
+    [ -f /sys/firmware/devicetree/base/model ] && grep -qi "raspberry" /sys/firmware/devicetree/base/model 2>/dev/null
+}
+
 # ==============================================================================
 # FUNCTION: EXTRAS MENU
 # ==============================================================================
 do_extras() {
     SUDOERS_FILE="/etc/sudoers.d/090_wallpanel_nopasswd"
+    WATCHDOG_SERVICE="/etc/systemd/system/kiosk-watchdog.service"
+    WATCHDOG_TIMER="/etc/systemd/system/kiosk-watchdog.timer"
+    SLEEP_SERVICE="/etc/systemd/system/kiosk-display-sleep.service"
+    SLEEP_ON_TIMER="/etc/systemd/system/kiosk-display-on.timer"
+    SLEEP_OFF_TIMER="/etc/systemd/system/kiosk-display-off.timer"
 
     while true; do
-        # Check current state
-        if [ -f "$SUDOERS_FILE" ]; then
-            SUDO_STATUS="ENABLED"
-        else
-            SUDO_STATUS="DISABLED"
-        fi
+        # Check current states
+        [ -f "$SUDOERS_FILE" ] && SUDO_STATUS="ENABLED" || SUDO_STATUS="DISABLED"
+        systemctl is-enabled kiosk-watchdog.timer &>/dev/null && WATCHDOG_STATUS="ENABLED" || WATCHDOG_STATUS="DISABLED"
+        systemctl is-enabled kiosk-display-on.timer &>/dev/null && SLEEP_STATUS="ENABLED" || SLEEP_STATUS="DISABLED"
 
-        EXTRA_CHOICE=$(whiptail --title "Extras Menu" --menu "Select a feature to toggle:" 15 65 3 \
-        "Sudoless" "Passwordless Sudo (Current: $SUDO_STATUS)" \
+        EXTRA_CHOICE=$(whiptail --title "Extras Menu" --menu "Select a feature:" 16 70 5 \
+        "Sudoless" "Passwordless Sudo ($SUDO_STATUS)" \
+        "Watchdog" "Auto-restart Chromium if crashed ($WATCHDOG_STATUS)" \
+        "Sleep" "Display Sleep Schedule ($SLEEP_STATUS)" \
+        "Brightness" "[EXPERIMENTAL] Adjust Screen Brightness" \
         "Back" "Return to Main Menu" 3>&1 1>&2 2>&3)
 
         if [ "$EXTRA_CHOICE" == "Back" ] || [ -z "$EXTRA_CHOICE" ]; then return; fi
 
+        # --- Passwordless Sudo ---
         if [ "$EXTRA_CHOICE" == "Sudoless" ]; then
             if [ "$SUDO_STATUS" == "ENABLED" ]; then
                 rm -f "$SUDOERS_FILE"
@@ -71,6 +98,135 @@ do_extras() {
                 echo "$REAL_USER ALL=(ALL) NOPASSWD: ALL" > "$SUDOERS_FILE"
                 chmod 0440 "$SUDOERS_FILE"
                 msg "Passwordless Sudo has been ENABLED for user '$REAL_USER'.\n\nBe careful, this reduces security."
+            fi
+        fi
+
+        # --- Watchdog ---
+        if [ "$EXTRA_CHOICE" == "Watchdog" ]; then
+            if [ "$WATCHDOG_STATUS" == "ENABLED" ]; then
+                systemctl disable --now kiosk-watchdog.timer 2>/dev/null
+                rm -f "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER"
+                systemctl daemon-reload
+                msg "Watchdog has been DISABLED."
+            else
+                cat > "$WATCHDOG_SERVICE" <<EOF
+[Unit]
+Description=Kiosk Chromium Watchdog
+[Service]
+Type=oneshot
+User=$REAL_USER
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-1
+ExecStart=/bin/bash -c 'pgrep -x chromium || (systemctl --user restart labwc || loginctl terminate-user $REAL_USER)'
+EOF
+
+                cat > "$WATCHDOG_TIMER" <<EOF
+[Unit]
+Description=Run Kiosk Watchdog every 2 minutes
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+[Install]
+WantedBy=timers.target
+EOF
+                systemctl daemon-reload
+                systemctl enable --now kiosk-watchdog.timer
+                msg "Watchdog has been ENABLED.\n\nChromium will be monitored every 2 minutes and the session restarted if it crashes."
+            fi
+        fi
+
+        # --- Display Sleep Schedule ---
+        if [ "$EXTRA_CHOICE" == "Sleep" ]; then
+            if [ "$SLEEP_STATUS" == "ENABLED" ]; then
+                systemctl disable --now kiosk-display-on.timer kiosk-display-off.timer 2>/dev/null
+                rm -f "$SLEEP_SERVICE" "$SLEEP_ON_TIMER" "$SLEEP_OFF_TIMER"
+                systemctl daemon-reload
+                msg "Display Sleep Schedule has been DISABLED."
+            else
+                SLEEP_OFF_TIME=$(ask "Enter time to turn display OFF (HH:MM):" "22:00")
+                SLEEP_ON_TIME=$(ask "Enter time to turn display ON (HH:MM):" "07:00")
+                
+                # Validate times
+                if ! [[ "$SLEEP_OFF_TIME" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+                    msg "Invalid OFF time. Using default 22:00"
+                    SLEEP_OFF_TIME="22:00"
+                fi
+                if ! [[ "$SLEEP_ON_TIME" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+                    msg "Invalid ON time. Using default 07:00"
+                    SLEEP_ON_TIME="07:00"
+                fi
+
+                cat > "$SLEEP_SERVICE" <<EOF
+[Unit]
+Description=Kiosk Display Power Control
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'echo %i > /sys/class/backlight/*/bl_power 2>/dev/null || wlr-randr --output $DISPLAY_OUTPUT --%i'
+EOF
+
+                cat > "$SLEEP_OFF_TIMER" <<EOF
+[Unit]
+Description=Turn display off at $SLEEP_OFF_TIME
+[Timer]
+OnCalendar=*-*-* ${SLEEP_OFF_TIME}:00
+Persistent=false
+[Install]
+WantedBy=timers.target
+EOF
+
+                cat > "$SLEEP_ON_TIMER" <<EOF
+[Unit]
+Description=Turn display on at $SLEEP_ON_TIME
+[Timer]
+OnCalendar=*-*-* ${SLEEP_ON_TIME}:00
+Persistent=false
+[Install]
+WantedBy=timers.target
+EOF
+
+                # Create instantiated service links
+                ln -sf "$SLEEP_SERVICE" /etc/systemd/system/kiosk-display-sleep@.service
+                cat > /etc/systemd/system/kiosk-display-off.service <<EOF
+[Unit]
+Description=Turn display off
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'echo 1 > /sys/class/backlight/*/bl_power 2>/dev/null; wlr-randr --output $DISPLAY_OUTPUT --off 2>/dev/null || true'
+EOF
+                cat > /etc/systemd/system/kiosk-display-on.service <<EOF
+[Unit]
+Description=Turn display on
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'echo 0 > /sys/class/backlight/*/bl_power 2>/dev/null; wlr-randr --output $DISPLAY_OUTPUT --on 2>/dev/null || true'
+EOF
+
+                systemctl daemon-reload
+                systemctl enable --now kiosk-display-on.timer kiosk-display-off.timer
+                msg "Display Sleep Schedule ENABLED.\n\nDisplay OFF: $SLEEP_OFF_TIME\nDisplay ON: $SLEEP_ON_TIME"
+            fi
+        fi
+
+        # --- Brightness (Experimental) ---
+        if [ "$EXTRA_CHOICE" == "Brightness" ]; then
+            # Try to find backlight
+            BACKLIGHT_PATH=$(find /sys/class/backlight -maxdepth 1 -type l | head -n 1)
+            
+            if [ -z "$BACKLIGHT_PATH" ]; then
+                msg "[EXPERIMENTAL]\n\nNo backlight control detected.\n\nThis feature only works with DSI displays or displays with DDC/CI support."
+            else
+                MAX_BRIGHT=$(cat "$BACKLIGHT_PATH/max_brightness" 2>/dev/null || echo 255)
+                CUR_BRIGHT=$(cat "$BACKLIGHT_PATH/brightness" 2>/dev/null || echo 128)
+                CUR_PERCENT=$((CUR_BRIGHT * 100 / MAX_BRIGHT))
+                
+                NEW_PERCENT=$(ask "[EXPERIMENTAL] Set Brightness (0-100%):" "$CUR_PERCENT")
+                if [[ "$NEW_PERCENT" =~ ^[0-9]+$ ]] && [ "$NEW_PERCENT" -ge 0 ] && [ "$NEW_PERCENT" -le 100 ]; then
+                    NEW_BRIGHT=$((NEW_PERCENT * MAX_BRIGHT / 100))
+                    echo "$NEW_BRIGHT" > "$BACKLIGHT_PATH/brightness"
+                    msg "Brightness set to $NEW_PERCENT%\n\nNote: This change is temporary and will reset on reboot."
+                else
+                    msg "Invalid value. Please enter a number between 0 and 100."
+                fi
             fi
         fi
     done
@@ -91,7 +247,8 @@ do_uninstall() {
 
     # 1. Remove Packages (EXCLUDING openssh-server for safety)
     echo ">>> Purging packages..."
-    PACKAGES="labwc greetd kanshi chromium-browser rpi-chromium-mods wtype libinput-tools unattended-upgrades"
+    PACKAGES="labwc greetd kanshi chromium-browser wtype libinput-tools wlr-randr unattended-upgrades"
+    is_raspberry_pi && PACKAGES="$PACKAGES rpi-chromium-mods"
     DEBIAN_FRONTEND=noninteractive apt purge -y $PACKAGES
     apt autoremove -y
 
@@ -112,6 +269,24 @@ do_uninstall() {
     systemctl disable --now kiosk-reboot.timer 2>/dev/null
     rm -f /etc/systemd/system/kiosk-reboot.service
     rm -f /etc/systemd/system/kiosk-reboot.timer
+    
+    # Remove Watchdog
+    systemctl disable --now kiosk-watchdog.timer 2>/dev/null
+    rm -f /etc/systemd/system/kiosk-watchdog.service
+    rm -f /etc/systemd/system/kiosk-watchdog.timer
+    
+    # Remove Display Sleep Timers
+    systemctl disable --now kiosk-display-on.timer kiosk-display-off.timer 2>/dev/null
+    rm -f /etc/systemd/system/kiosk-display-sleep.service
+    rm -f /etc/systemd/system/kiosk-display-sleep@.service
+    rm -f /etc/systemd/system/kiosk-display-on.service
+    rm -f /etc/systemd/system/kiosk-display-off.service
+    rm -f /etc/systemd/system/kiosk-display-on.timer
+    rm -f /etc/systemd/system/kiosk-display-off.timer
+    
+    # Remove Chromium tmpfs cache mount
+    sed -i '/\/tmp\/chromium-cache/d' /etc/fstab
+    rm -rf /tmp/chromium-cache
     
     rmdir /etc/systemd/system/greetd.service.d 2>/dev/null
 
@@ -170,8 +345,8 @@ if [ -z "$STRATEGY" ]; then exit 0; fi
 if [ "$STRATEGY" == "Auto" ]; then
     MODE="preferred"
 else
-    # Propose resolutions logic
-    DRM_MODES=$(find /sys/class/drm -name "card*-HDMI-A-1" -exec cat {}/modes 2>/dev/null \;)
+    # Propose resolutions logic - use detected display output
+    DRM_MODES=$(cat /sys/class/drm/card*-${DISPLAY_OUTPUT}/modes 2>/dev/null)
     MENU_ARGS=()
     if [ ! -z "$DRM_MODES" ]; then
         while read -r line; do MENU_ARGS+=("$line@60" "Detected"); done <<< "$DRM_MODES"
@@ -204,8 +379,12 @@ ROTATION=$(whiptail --title "Screen Rotation" --menu "Select Orientation" 15 60 
 if [ -z "$ROTATION" ]; then exit 0; fi
 
 # 4. Always On
-if [ "$saved_FORCE_HDMI" == "no" ]; then DEFAULT_HDMI="--defaultno"; else DEFAULT_HDMI=""; fi
-if (whiptail --title "Connection Stability" --yesno "Enable 'Always On' (Force HDMI Hotplug)?" 15 60 $DEFAULT_HDMI); then
+if [ "$saved_FORCE_HDMI" == "yes" ]; then
+    whiptail --title "Connection Stability" --yesno "Enable 'Always On' (Force HDMI Hotplug)?" 15 60
+else
+    whiptail --title "Connection Stability" --yesno "Enable 'Always On' (Force HDMI Hotplug)?" 15 60 --defaultno
+fi
+if [ $? -eq 0 ]; then
     FORCE_HDMI="yes"
 else
     FORCE_HDMI="no"
@@ -215,8 +394,12 @@ fi
 TOUCH_DEVICE=$(ask "Enter Touch Device Name (Empty to skip):" "$DETECTED_TOUCH")
 
 # 6. Silent Boot
-if [ "$saved_SILENT_BOOT" == "yes" ]; then DEFAULT_SILENT="--defaultyes"; else DEFAULT_SILENT="--defaultno"; fi
-if (whiptail --title "Boot Aesthetics" --yesno "Enable Silent Boot (Appliance Mode)?\n\n- Hides scrolling text/logos.\n- Hides console cursor.\n- Prevents screen from blanking (sleep)." 15 60 $DEFAULT_SILENT); then
+if [ "$saved_SILENT_BOOT" == "yes" ]; then
+    whiptail --title "Boot Aesthetics" --yesno "Enable Silent Boot (Appliance Mode)?\n\n- Hides scrolling text/logos.\n- Hides console cursor.\n- Prevents screen from blanking (sleep)." 15 60
+else
+    whiptail --title "Boot Aesthetics" --yesno "Enable Silent Boot (Appliance Mode)?\n\n- Hides scrolling text/logos.\n- Hides console cursor.\n- Prevents screen from blanking (sleep)." 15 60 --defaultno
+fi
+if [ $? -eq 0 ]; then
     SILENT_BOOT="yes"
 else
     SILENT_BOOT="no"
@@ -233,6 +416,11 @@ REBOOT_SCHEDULE=$(whiptail --title "Maintenance" --menu "Scheduled Reboot" 15 60
 if [ "$REBOOT_SCHEDULE" != "Disabled" ]; then
     DEFAULT_TIME=${saved_REBOOT_TIME:-"03:00"}
     REBOOT_TIME=$(ask "Enter Reboot Time (24h format HH:MM):" "$DEFAULT_TIME")
+    # Validate time format
+    if ! [[ "$REBOOT_TIME" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+        msg "Invalid time format. Using default 03:00"
+        REBOOT_TIME="03:00"
+    fi
 else
     REBOOT_TIME=""
 fi
@@ -240,21 +428,34 @@ fi
 # 8. Timezone
 DEFAULT_TZ=${saved_TIMEZONE:-"Europe/Rome"}
 TIMEZONE=$(ask "Enter Timezone (Required for Reboot Schedule):" "$DEFAULT_TZ")
+# Validate timezone
+if [ ! -f "/usr/share/zoneinfo/$TIMEZONE" ]; then
+    msg "Invalid timezone '$TIMEZONE'. Using default Europe/Rome"
+    TIMEZONE="Europe/Rome"
+fi
 
 # 9. Hostname
 NEW_HOSTNAME=$(ask "Enter Hostname:" "${saved_HOSTNAME:-$CURRENT_HOSTNAME}")
 
 # 10. SSH
-if [ "$saved_ENABLE_SSH" == "no" ]; then DEFAULT_SSH="--defaultno"; else DEFAULT_SSH=""; fi
-if (whiptail --title "Remote Access" --yesno "Enable SSH Server?" 10 60 $DEFAULT_SSH); then
+if [ "$saved_ENABLE_SSH" == "yes" ]; then
+    whiptail --title "Remote Access" --yesno "Enable SSH Server?" 10 60
+else
+    whiptail --title "Remote Access" --yesno "Enable SSH Server?" 10 60 --defaultno
+fi
+if [ $? -eq 0 ]; then
     ENABLE_SSH="yes"
 else
     ENABLE_SSH="no"
 fi
 
 # 11. Security
-if [ "$saved_ENABLE_SECURITY" == "no" ]; then DEFAULT_SEC="--defaultno"; else DEFAULT_SEC=""; fi
-if (whiptail --title "Security" --yesno "Enable Unattended Upgrades?" 10 60 $DEFAULT_SEC); then
+if [ "$saved_ENABLE_SECURITY" == "yes" ]; then
+    whiptail --title "Security" --yesno "Enable Unattended Upgrades?" 10 60
+else
+    whiptail --title "Security" --yesno "Enable Unattended Upgrades?" 10 60 --defaultno
+fi
+if [ $? -eq 0 ]; then
     ENABLE_SECURITY="yes"
 else
     ENABLE_SECURITY="no"
@@ -292,24 +493,58 @@ if [ "$ACTION" != "Apply" ]; then
 fi
 
 # ==============================================================================
-# PHASE 3: INSTALLATION
+# PHASE 3: INSTALLATION (with progress bar)
 # ==============================================================================
+
+# Progress bar helper
+PROGRESS_PIPE=$(mktemp -u)
+mkfifo "$PROGRESS_PIPE"
+
+show_progress() {
+    whiptail --title "Installing Wallpanel" --gauge "Starting installation..." 8 70 0 < "$PROGRESS_PIPE" &
+    PROGRESS_PID=$!
+}
+
+update_progress() {
+    echo -e "XXX\n$1\n$2\nXXX" > "$PROGRESS_PIPE"
+}
+
+finish_progress() {
+    echo "100" > "$PROGRESS_PIPE"
+    wait $PROGRESS_PID 2>/dev/null
+    rm -f "$PROGRESS_PIPE"
+}
+
 clear
-echo -e "\033[1;34m>>> [1/5] Checking Packages...\033[0m"
-PACKAGES="labwc greetd kanshi chromium-browser rpi-chromium-mods wtype libinput-tools"
+show_progress
+
+# Step 1: Update package lists (0-15%)
+update_progress 0 "Updating package lists..."
+apt update -qq > /dev/null 2>&1
+update_progress 15 "Package lists updated."
+
+# Step 2: Install packages (15-50%)
+update_progress 16 "Installing packages..."
+PACKAGES="labwc greetd kanshi chromium-browser wtype libinput-tools wlr-randr"
+is_raspberry_pi && PACKAGES="$PACKAGES rpi-chromium-mods"
 [ "$ENABLE_SECURITY" == "yes" ] && PACKAGES="$PACKAGES unattended-upgrades"
 [ "$ENABLE_SSH" == "yes" ] && PACKAGES="$PACKAGES openssh-server"
-DEBIAN_FRONTEND=noninteractive apt install -y $PACKAGES
+DEBIAN_FRONTEND=noninteractive apt install -y -qq $PACKAGES > /dev/null 2>&1
+update_progress 50 "Packages installed."
 
 # ==============================================================================
 # PHASE 4: CONFIGURATION APPLICATION
 # ==============================================================================
 
-echo -e "\033[1;34m>>> [2/5] System Access & Maintenance...\033[0m"
+# Step 3: System configuration (50-65%)
+update_progress 51 "Configuring system..."
+
 # Hostname
-if [ ! -z "$NEW_HOSTNAME" ] && [ "$NEW_HOSTNAME" != "$CURRENT_HOSTNAME" ]; then
+if [ -n "$NEW_HOSTNAME" ] && [ "$NEW_HOSTNAME" != "$CURRENT_HOSTNAME" ]; then
     hostnamectl set-hostname "$NEW_HOSTNAME"
-    sed -i "s/127.0.1.1.*$CURRENT_HOSTNAME/127.0.1.1\t$NEW_HOSTNAME/g" /etc/hosts
+    # Escape special regex characters in hostname
+    ESCAPED_HOSTNAME=$(printf '%s\n' "$CURRENT_HOSTNAME" | sed 's/[.[\/^$*]/\\&/g')
+    sed -i "s/127.0.1.1.*$ESCAPED_HOSTNAME/127.0.1.1\t$NEW_HOSTNAME/g" /etc/hosts
 fi
 
 # Timezone
@@ -358,7 +593,10 @@ else
     systemctl daemon-reload
 fi
 
-echo -e "\033[1;34m>>> [3/5] Kernel Configuration...\033[0m"
+update_progress 65 "System configured."
+
+# Step 4: Kernel configuration (65-75%)
+update_progress 66 "Configuring kernel parameters..."
 CMDLINE="/boot/firmware/cmdline.txt"
 
 # 1. CLEANUP
@@ -379,13 +617,18 @@ if [ "$SILENT_BOOT" == "yes" ]; then
 fi
 
 # 3. APPLY
-if [ ! -z "$KERNEL_VID_ARG" ] || [ ! -z "$SILENT_ARGS" ]; then
-    sed -i "s/$/ $KERNEL_VID_ARG $SILENT_ARGS/" "$CMDLINE"
-    echo "Kernel updated: $KERNEL_VID_ARG $SILENT_ARGS"
+KERNEL_APPEND=""
+[ -n "$KERNEL_VID_ARG" ] && KERNEL_APPEND="$KERNEL_VID_ARG"
+[ -n "$SILENT_ARGS" ] && KERNEL_APPEND="${KERNEL_APPEND:+$KERNEL_APPEND }$SILENT_ARGS"
+if [ -n "$KERNEL_APPEND" ]; then
+    sed -i "s/$/ $KERNEL_APPEND/" "$CMDLINE"
 fi
 
-echo -e "\033[1;34m>>> [4/5] Network Wait...\033[0m"
-systemctl enable NetworkManager-wait-online.service
+update_progress 75 "Kernel configured."
+
+# Step 5: Network configuration (75-85%)
+update_progress 76 "Configuring network wait..."
+systemctl enable NetworkManager-wait-online.service > /dev/null 2>&1
 mkdir -p /etc/systemd/system/greetd.service.d
 cat > /etc/systemd/system/greetd.service.d/override.conf <<EOF
 [Unit]
@@ -394,13 +637,19 @@ Wants=network-online.target
 EOF
 systemctl daemon-reload
 
-echo -e "\033[1;34m>>> [5/5] Wayland Config...\033[0m"
+update_progress 85 "Network configured."
+
+# Step 6: Wayland configuration (85-100%)
+update_progress 86 "Configuring Wayland and Chromium..."
 
 # Kanshi
 mkdir -p "$USER_HOME/.config/kanshi"
+# Convert rotation to Kanshi transform value (0 = normal)
+KANSHI_TRANSFORM="$ROTATION"
+[ "$ROTATION" == "0" ] && KANSHI_TRANSFORM="normal"
 cat > "$USER_HOME/.config/kanshi/config" <<EOF
 profile {
-    output HDMI-A-1 mode $MODE transform $ROTATION
+    output $DISPLAY_OUTPUT mode $MODE transform $KANSHI_TRANSFORM
 }
 EOF
 
@@ -411,7 +660,7 @@ cat > "$USER_HOME/.config/labwc/rc.xml" <<EOF
 <labwc_config>
 EOF
 if [ ! -z "$TOUCH_DEVICE" ]; then
-    echo "  <touch deviceName=\"$TOUCH_DEVICE\" mapToOutput=\"HDMI-A-1\"/>" >> "$USER_HOME/.config/labwc/rc.xml"
+    echo "  <touch deviceName=\"$TOUCH_DEVICE\" mapToOutput=\"$DISPLAY_OUTPUT\"/>" >> "$USER_HOME/.config/labwc/rc.xml"
 fi
 cat >> "$USER_HOME/.config/labwc/rc.xml" <<EOF
   <keyboard>
@@ -422,6 +671,14 @@ cat >> "$USER_HOME/.config/labwc/rc.xml" <<EOF
 EOF
 
 # Autostart
+# Setup tmpfs cache for Chromium (better performance, preserves SD card)
+CACHE_DIR="/tmp/chromium-cache"
+if ! grep -q "/tmp/chromium-cache" /etc/fstab; then
+    echo "tmpfs /tmp/chromium-cache tmpfs nodev,nosuid,size=100M 0 0" >> /etc/fstab
+fi
+mkdir -p /tmp/chromium-cache
+mount /tmp/chromium-cache 2>/dev/null || true
+
 cat > "$USER_HOME/.config/labwc/autostart" <<EOF
 #!/bin/bash
 kanshi &
@@ -436,7 +693,7 @@ sleep 2
     --start-fullscreen --start-maximized --fast --fast-start \\
     --no-sandbox --no-first-run --noerrdialogs \\
     --disable-translate --disable-notifications --disable-infobars --disable-pinch \\
-    --disable-features=TranslateUI --disk-cache-dir=/dev/null \\
+    --disable-features=TranslateUI --disk-cache-dir=$CACHE_DIR \\
     --ozone-platform=wayland \\
     --enable-features=OverlayScrollbar,CanvasOopRasterization \\
     --overscroll-history-navigation=0 --password-store=basic --force-dark-mode \\
@@ -467,6 +724,9 @@ else
 fi
 
 chown -R "$REAL_USER:$REAL_USER" "$USER_HOME/.config"
+
+update_progress 100 "Installation complete!"
+finish_progress
 
 msg "Installation Complete!\n\nRebooting is required to apply changes."
 reboot
