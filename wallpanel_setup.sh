@@ -1,13 +1,36 @@
 #!/bin/bash
 
 # ==============================================================================
-# WALLPANEL SETUP SCRIPT v4.1
+# WALLPANEL SETUP SCRIPT v4.4
 # ==============================================================================
 # A complete kiosk system for running Home Assistant on dedicated displays
 # Configures Wayland (labwc), Chromium browser, and system optimization
 #
 # CHANGELOG:
-# v4.1 (Current)
+# v4.4 (Current)
+#   - Removed progress bar (whiptail gauge) - now uses plain console output
+#   - Deprecated -v flag (verbose is now default and only mode)
+#   - Cleaner installation experience with visible progress
+#   - Added Swap & Log2RAM feature to Extras menu for SD card longevity
+#   - Removed redundant tmpfs mount for Chromium cache (/tmp is already tmpfs)
+#   - Removed Sudoless menu (passwordless sudo is default in Raspberry Pi OS)
+#
+# v4.3
+#   - Fixed yes/no dialog defaults to respect saved configuration
+#   - Touch device manual entry now pre-fills with saved value
+#   - Removed SSH configuration entirely (script no longer touches SSH)
+#
+# v4.2
+#   - Added input validation (URL, time format, percentage)
+#   - Replaced sed with atomic cmdline operations (safer boot config handling)
+#   - Implemented native labwc cursor hiding (W-h keybind)
+#   - Enhanced touch device filtering (excludes keyboard, mouse, video devices)
+#   - Added Chromium crash bubble fix (sed Preferences file)
+#   - Removed network wait before browser start (Chromium handles retry)
+#   - Comprehensive inline documentation added
+#   - Added sleep delays for kanshi and crash fix completion
+#
+# v4.1
 #   - Backported production performance flags (Vaapi, GPU acceleration)
 #   - Improved Greetd/autostart logic over production version
 #   - Added Chrome sync/extension/update disabling for stability
@@ -29,18 +52,13 @@
 # INITIALIZATION
 # ==============================================================================
 
-# Parse command line arguments for verbose mode
-VERBOSE_MODE="no"
-if [ "$1" == "-v" ]; then
-    VERBOSE_MODE="yes"
-    echo ">>> VERBOSE MODE ENABLED. Progress bars disabled."
-    sleep 1
-fi
-
 # Determine script directory and configuration file location
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 CONFIG_FILE="$SCRIPT_DIR/.kiosk-config"
 ERROR_LOG="/tmp/wallpanel_install_error.log"
+
+# Clean up any previous error logs
+rm -f "$ERROR_LOG"
 
 # Verify script is run with root privileges
 if [ "$EUID" -ne 0 ]; then
@@ -129,9 +147,9 @@ read_cmdline() {
 write_cmdline() {
     local new_content="$1"
     local temp_file="${CMDLINE}.tmp"
-    
+
     echo -n "$new_content" > "$temp_file"
-    
+
     # Validate the new file isn't empty and has reasonable content
     if [ -s "$temp_file" ] && [ $(wc -c < "$temp_file") -gt 10 ]; then
         mv "$temp_file" "$CMDLINE"
@@ -154,23 +172,22 @@ remove_cmdline_param() {
 add_cmdline_param() {
     local param="$1"
     local current=$(read_cmdline)
-    
+
     # Check if parameter already exists
     if echo "$current" | grep -q "$param"; then
         return 0
     fi
-    
+
     write_cmdline "${current} ${param}"
 }
 
 # ==============================================================================
 # EXTRAS MENU
 # ==============================================================================
-# Provides optional features: passwordless sudo, watchdog, sleep schedule, brightness
+# Provides optional features: watchdog, sleep schedule, brightness, swap & log2ram
 
 do_extras() {
     # Define service file paths
-    SUDOERS_FILE="/etc/sudoers.d/090_wallpanel_nopasswd"
     WATCHDOG_SERVICE="/etc/systemd/system/kiosk-watchdog.service"
     WATCHDOG_TIMER="/etc/systemd/system/kiosk-watchdog.timer"
     SLEEP_SERVICE="/etc/systemd/system/kiosk-display-sleep.service"
@@ -179,31 +196,18 @@ do_extras() {
 
     while true; do
         # Detect current status of each feature
-        [ -f "$SUDOERS_FILE" ] && SUDO_STATUS="ENABLED" || SUDO_STATUS="DISABLED"
         systemctl is-enabled kiosk-watchdog.timer &>/dev/null && WATCHDOG_STATUS="ENABLED" || WATCHDOG_STATUS="DISABLED"
         systemctl is-enabled kiosk-display-on.timer &>/dev/null && SLEEP_STATUS="ENABLED" || SLEEP_STATUS="DISABLED"
 
         # Display extras menu with current status
-        EXTRA_CHOICE=$(whiptail --title "Extras Menu" --menu "Select a feature:" 16 70 5 \
-        "Sudoless" "Passwordless Sudo ($SUDO_STATUS)" \
+        EXTRA_CHOICE=$(whiptail --title "Extras Menu" --menu "Select a feature:" 16 78 5 \
         "Watchdog" "Auto-restart Chromium if crashed ($WATCHDOG_STATUS)" \
         "Sleep" "Display Sleep Schedule ($SLEEP_STATUS)" \
         "Brightness" "[EXPERIMENTAL] Adjust Screen Brightness" \
+        "Swap & Log2RAM" "Disable swap & move logs to RAM (SD longevity)" \
         "Back" "Return to Main Menu" 3>&1 1>&2 2>&3)
 
         if [ "$EXTRA_CHOICE" == "Back" ] || [ -z "$EXTRA_CHOICE" ]; then return; fi
-
-        # Toggle passwordless sudo for the current user
-        if [ "$EXTRA_CHOICE" == "Sudoless" ]; then
-            if [ "$SUDO_STATUS" == "ENABLED" ]; then
-                rm -f "$SUDOERS_FILE"
-                msg "Passwordless Sudo has been DISABLED."
-            else
-                echo "$REAL_USER ALL=(ALL) NOPASSWD: ALL" > "$SUDOERS_FILE"
-                chmod 0440 "$SUDOERS_FILE"
-                msg "Passwordless Sudo has been ENABLED for user '$REAL_USER'."
-            fi
-        fi
 
         # Configure watchdog timer to restart Chromium if it crashes
         # Checks every 2 minutes if chromium process exists, restarts labwc if not
@@ -258,13 +262,13 @@ EOF
                     msg "Invalid time format. Use HH:MM (24-hour format)."
                     continue
                 fi
-                
+
                 SLEEP_ON_TIME=$(ask "Enter time to turn display ON (HH:MM):" "07:00")
                 if ! validate_time "$SLEEP_ON_TIME"; then
                     msg "Invalid time format. Use HH:MM (24-hour format)."
                     continue
                 fi
-                
+
                 # Create systemd service template for display power control
                 cat > "$SLEEP_SERVICE" <<EOF
 [Unit]
@@ -334,7 +338,7 @@ EOF
                 CUR_BRIGHT=$(cat "$BACKLIGHT_PATH/brightness" 2>/dev/null || echo 128)
                 CUR_PERCENT=$((CUR_BRIGHT * 100 / MAX_BRIGHT))
                 NEW_PERCENT=$(ask "Set Brightness (0-100%):" "$CUR_PERCENT")
-                
+
                 if validate_percentage "$NEW_PERCENT"; then
                     NEW_BRIGHT=$((NEW_PERCENT * MAX_BRIGHT / 100))
                     echo "$NEW_BRIGHT" > "$BACKLIGHT_PATH/brightness"
@@ -342,6 +346,28 @@ EOF
                 else
                     msg "Invalid percentage. Must be 0-100."
                 fi
+            fi
+        fi
+
+        # Disable swap and install log2ram for SD card longevity
+        if [ "$EXTRA_CHOICE" == "Swap & Log2RAM" ]; then
+            if whiptail --title "Swap & Log2RAM" --yesno "This will:\n\n• Disable swap on disk\n• Move logs to RAM\n• Install log2ram package\n\nThis increases SD card longevity but reduces\nsystem stability under memory pressure.\n\nA reboot will be required after completion.\n\nProceed?" 18 60; then
+                clear
+                echo ">>> Disabling swap..."
+                swapoff -a
+                apt purge -y rpi-swap systemd-zram-generator 2>/dev/null
+                rm -f /var/swap
+                systemctl mask var-swap.swap 2>/dev/null
+                echo ""
+
+                echo ">>> Installing log2ram..."
+                apt install -y log2ram
+                echo ""
+
+                echo -e "\033[1;32m>>> Swap disabled and log2ram installed successfully.\033[0m"
+                echo "Please reboot for log2ram to take effect."
+                echo ""
+                read -p "Press Enter to continue..."
             fi
         fi
     done
@@ -355,23 +381,18 @@ EOF
 do_uninstall() {
     if ! (whiptail --title "Factory Reset" --yesno "WARNING: Full Factory Reset.\n\nProceed?" 20 60 --defaultno); then return; fi
     clear
-    
+
     echo ">>> Purging packages..."
-    DEBIAN_FRONTEND=noninteractive apt purge -y labwc greetd kanshi chromium chromium-browser wtype libinput-tools wlr-randr unattended-upgrades rpi-chromium-mods
+    DEBIAN_FRONTEND=noninteractive apt purge -y labwc greetd kanshi chromium wtype libinput-tools wlr-randr unattended-upgrades rpi-chromium-mods
     apt autoremove -y
 
     echo ">>> Removing config files..."
     rm -rf "$USER_HOME/.config/labwc" "$USER_HOME/.config/kanshi" "$USER_HOME/.config/chromium"
     rm -f /etc/greetd/config.toml /etc/systemd/system/greetd.service.d/override.conf "$CONFIG_FILE"
-    rm -f "/etc/sudoers.d/090_wallpanel_nopasswd"
-    
+
     # Disable and remove all kiosk-related systemd services
     systemctl disable --now kiosk-reboot.timer kiosk-watchdog.timer kiosk-display-on.timer kiosk-display-off.timer 2>/dev/null
     rm -f /etc/systemd/system/kiosk-*
-    
-    # Remove tmpfs mount for Chromium cache
-    sed -i '/\/tmp\/chromium-cache/d' /etc/fstab
-    rm -rf /tmp/chromium-cache
 
     echo ">>> Restoring Kernel parameters..."
     # Remove kiosk-specific boot parameters
@@ -386,7 +407,7 @@ do_uninstall() {
     systemctl disable NetworkManager-wait-online.service
     systemctl set-default multi-user.target
     systemctl daemon-reload
-    
+
     echo -e "\033[1;32m>>> UNINSTALL COMPLETE. Reboot recommended.\033[0m"
     exit 0
 }
@@ -399,7 +420,7 @@ do_uninstall() {
 while true; do
     MAIN_CHOICE=$(whiptail --title "Wallpanel Setup" --menu "Select an option:" 16 60 4 \
     "Install" "Configure and Install Wallpanel" \
-    "Extras" "Additional Tools (Sudoless, etc)" \
+    "Extras" "Additional Tools (Watchdog, Sleep, etc)" \
     "Uninstall" "Remove Wallpanel and Revert to Stock" \
     "Exit" "Quit" 3>&1 1>&2 2>&3)
 
@@ -419,7 +440,7 @@ while true; do
     DEFAULT_URL=${saved_KIOSK_URL:-"http://homeassistant.local:8123"}
     KIOSK_URL=$(ask "Enter the Home Assistant URL:" "$DEFAULT_URL")
     if [ -z "$KIOSK_URL" ]; then exit 0; fi
-    
+
     if validate_url "$KIOSK_URL"; then
         break
     else
@@ -441,25 +462,25 @@ else
     # Read available modes from DRM subsystem for the connected display
     DRM_MODES=$(cat /sys/class/drm/card*-${DISPLAY_OUTPUT}/modes 2>/dev/null)
     MENU_ARGS=()
-    
+
     # Build menu with detected resolutions
-    if [ ! -z "$DRM_MODES" ]; then 
-        while read -r line; do 
+    if [ ! -z "$DRM_MODES" ]; then
+        while read -r line; do
             MENU_ARGS+=("$line@60" "Detected")
         done <<< "$DRM_MODES"
     fi
-    
+
     # Add common fallback options
     MENU_ARGS+=("1920x1080@60" "Standard 1080p")
     MENU_ARGS+=("Custom" "Manual Entry")
-    
+
     DEFAULT_RES=${saved_MODE:-"1920x1080@60"}
     SEL_RES=$(whiptail --title "Select Resolution" --menu "Choose Resolution:" 20 70 10 "${MENU_ARGS[@]}" --default-item "$DEFAULT_RES" 3>&1 1>&2 2>&3)
     if [ -z "$SEL_RES" ]; then exit 0; fi
-    
-    if [ "$SEL_RES" == "Custom" ]; then 
+
+    if [ "$SEL_RES" == "Custom" ]; then
         MODE=$(ask "Enter Custom Mode:" "$DEFAULT_RES")
-    else 
+    else
         MODE="$SEL_RES"
     fi
 fi
@@ -471,20 +492,36 @@ ROTATION=$(whiptail --title "Screen Rotation" --menu "Select Orientation" 15 60 
 if [ -z "$ROTATION" ]; then exit 0; fi
 
 # HDMI hotplug control (force signal even when display appears disconnected)
-whiptail --title "Connection" --yesno "Enable 'Always On' (Force HDMI Hotplug)?" 15 60 --defaultno && FORCE_HDMI="yes" || FORCE_HDMI="no"
+if [ "$saved_FORCE_HDMI" == "yes" ]; then
+    whiptail --title "Connection" --yesno "Enable 'Always On' (Force HDMI Hotplug)?" 15 60 --defaultyes && FORCE_HDMI="yes" || FORCE_HDMI="no"
+else
+    whiptail --title "Connection" --yesno "Enable 'Always On' (Force HDMI Hotplug)?" 15 60 --defaultno && FORCE_HDMI="yes" || FORCE_HDMI="no"
+fi
 
 # Touch device configuration with intelligent filtering
 TOUCH_DEVICE=""
-if whiptail --title "Touch Input" --yesno "Do you want to configure a Touchscreen?" 10 60; then
+if [ "$saved_TOUCH_DEVICE" == "" ]; then
+    TOUCH_DEFAULT="no"
+else
+    TOUCH_DEFAULT="yes"
+fi
+
+if [ "$TOUCH_DEFAULT" == "yes" ]; then
+    TOUCH_ASK=$(whiptail --title "Touch Input" --yesno "Do you want to configure a Touchscreen?" 10 60 --defaultyes 3>&1 1>&2 2>&3; echo $?)
+else
+    TOUCH_ASK=$(whiptail --title "Touch Input" --yesno "Do you want to configure a Touchscreen?" 10 60 --defaultno 3>&1 1>&2 2>&3; echo $?)
+fi
+
+if [ "$TOUCH_ASK" == "0" ]; then
     # Read all input devices from kernel
     mapfile -t DEV_LIST < <(grep 'N: Name=' /proc/bus/input/devices | sed 's/N: Name="//;s/"$//' | sort -u)
     TOUCH_MENU=()
-    
+
     # Filter out non-touch devices (GPU, audio, buttons, etc.)
     # This reduces clutter and shows only devices likely to be touchscreens
     for dev in "${DEV_LIST[@]}"; do
         ldev=${dev,,}
-        
+
         # Skip known non-touch device types
         if [[ "$ldev" == *"vc4"* ]] || [[ "$ldev" == *"hdmi"* ]] || \
            [[ "$ldev" == *"button"* ]] || [[ "$ldev" == *"gpio"* ]] || \
@@ -493,22 +530,26 @@ if whiptail --title "Touch Input" --yesno "Do you want to configure a Touchscree
            [[ "$ldev" == *"video"* ]] || [[ "$ldev" == *"camera"* ]]; then
            continue
         fi
-        
+
         TOUCH_MENU+=("$dev" "Device")
     done
-    
+
     TOUCH_MENU+=("Manual" "Type name manually")
     SEL_TOUCH=$(whiptail --title "Select Touch Device" --menu "Detected Devices:" 20 75 10 "${TOUCH_MENU[@]}" 3>&1 1>&2 2>&3)
-    
-    if [ "$SEL_TOUCH" == "Manual" ]; then 
-        TOUCH_DEVICE=$(ask "Enter Exact Touch Device Name:" "")
-    else 
+
+    if [ "$SEL_TOUCH" == "Manual" ]; then
+        TOUCH_DEVICE=$(ask "Enter Exact Touch Device Name:" "${saved_TOUCH_DEVICE}")
+    else
         TOUCH_DEVICE="$SEL_TOUCH"
     fi
 fi
 
 # Silent boot configuration (hide kernel messages, boot logo, cursor)
-whiptail --title "Boot" --yesno "Enable Silent Boot (Appliance Mode)?" 15 60 --defaultno && SILENT_BOOT="yes" || SILENT_BOOT="no"
+if [ "$saved_SILENT_BOOT" == "yes" ]; then
+    whiptail --title "Boot" --yesno "Enable Silent Boot (Appliance Mode)?" 15 60 --defaultyes && SILENT_BOOT="yes" || SILENT_BOOT="no"
+else
+    whiptail --title "Boot" --yesno "Enable Silent Boot (Appliance Mode)?" 15 60 --defaultno && SILENT_BOOT="yes" || SILENT_BOOT="no"
+fi
 
 # Scheduled reboot configuration for maintenance
 DEFAULT_SCHED=${saved_REBOOT_SCHEDULE:-"Disabled"}
@@ -531,11 +572,12 @@ fi
 # System timezone configuration
 TIMEZONE=$(ask "Enter Timezone:" "${saved_TIMEZONE:-Europe/Rome}")
 
-# SSH server toggle
-whiptail --title "SSH" --yesno "Enable SSH Server?" 10 60 --defaultno && ENABLE_SSH="yes" || ENABLE_SSH="no"
-
 # Automatic security updates toggle
-whiptail --title "Security" --yesno "Enable Unattended Upgrades?" 10 60 --defaultno && ENABLE_SECURITY="yes" || ENABLE_SECURITY="no"
+if [ "$saved_ENABLE_SECURITY" == "yes" ]; then
+    whiptail --title "Security" --yesno "Enable Unattended Upgrades?" 10 60 --defaultyes && ENABLE_SECURITY="yes" || ENABLE_SECURITY="no"
+else
+    whiptail --title "Security" --yesno "Enable Unattended Upgrades?" 10 60 --defaultno && ENABLE_SECURITY="yes" || ENABLE_SECURITY="no"
+fi
 
 # Save configuration for future runs
 cat > "$CONFIG_FILE" <<EOF
@@ -549,7 +591,6 @@ saved_SILENT_BOOT="$SILENT_BOOT"
 saved_REBOOT_SCHEDULE="$REBOOT_SCHEDULE"
 saved_REBOOT_TIME="$REBOOT_TIME"
 saved_TIMEZONE="$TIMEZONE"
-saved_ENABLE_SSH="$ENABLE_SSH"
 saved_ENABLE_SECURITY="$ENABLE_SECURITY"
 EOF
 chmod 600 "$CONFIG_FILE"
@@ -563,100 +604,55 @@ if [ "$ACTION" != "Apply" ]; then exit 0; fi
 # ==============================================================================
 # Applies configuration and installs all required packages and services
 
-# Setup progress reporting based on verbose mode
-if [ "$VERBOSE_MODE" == "yes" ]; then
-    setup_progress() { clear; echo ">>> STARTING INSTALLATION (Verbose Mode)"; }
-    update_progress() { echo -e "\n======================================================\n>>> $2\n======================================================"; }
-    finish_progress() { echo ">>> DONE."; }
-else
-    # Use whiptail gauge for visual progress in normal mode
-    setup_progress() { 
-        clear
-        PROGRESS_PIPE=$(mktemp -u)
-        mkfifo "$PROGRESS_PIPE"
-        whiptail --title "Installing Wallpanel" --gauge "Initializing..." 8 70 0 < "$PROGRESS_PIPE" &
-        WHIPTAIL_PID=$!
-        exec 3> "$PROGRESS_PIPE"
-    }
-    update_progress() { echo -e "XXX\n$1\n$2\nXXX" >&3; }
-    finish_progress() { exec 3>&-; wait $WHIPTAIL_PID 2>/dev/null; rm -f "$PROGRESS_PIPE"; }
-fi
+clear
+echo "======================================================================"
+echo "  WALLPANEL INSTALLATION"
+echo "======================================================================"
+echo ""
 
-setup_progress
-
-# Update package lists
-update_progress 0 "Updating package lists..."
+echo ">>> Updating package lists..."
 export DEBIAN_FRONTEND=noninteractive
-if [ "$VERBOSE_MODE" == "yes" ]; then 
-    apt-get update
-else 
-    apt-get update -qq > "$ERROR_LOG" 2>&1
-fi
-update_progress 15 "Package lists updated."
+apt-get update
+echo ""
 
-# Determine correct Chromium package name (varies by distribution)
-update_progress 16 "Determining packages..."
-CHROMIUM_PKG="chromium"
-if apt-cache policy chromium-browser | grep "Candidate:" | grep -v "(none)" > /dev/null; then 
-    CHROMIUM_PKG="chromium-browser"
-fi
+echo ">>> Determining packages..."
 
 # Add Raspberry Pi-specific optimizations if on Pi hardware
 MODS_PKG=""
-if is_raspberry_pi && apt-cache policy rpi-chromium-mods | grep "Candidate:" | grep -v "(none)" > /dev/null; then 
+if is_raspberry_pi && apt-cache policy rpi-chromium-mods | grep "Candidate:" | grep -v "(none)" > /dev/null; then
     MODS_PKG="rpi-chromium-mods"
 fi
 
 # Build package list based on configuration
-PACKAGES="labwc greetd kanshi $CHROMIUM_PKG wtype libinput-tools wlr-randr $MODS_PKG"
-[ "$ENABLE_SSH" == "yes" ] && PACKAGES="$PACKAGES openssh-server"
+PACKAGES="labwc greetd kanshi chromium wtype libinput-tools wlr-randr $MODS_PKG"
 [ "$ENABLE_SECURITY" == "yes" ] && PACKAGES="$PACKAGES unattended-upgrades"
 
-# Install all required packages
-update_progress 20 "Installing packages: $CHROMIUM_PKG $MODS_PKG ..."
-if [ "$VERBOSE_MODE" == "yes" ]; then
-    apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $PACKAGES
-    INSTALL_EXIT=$?
-else
-    if ! apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $PACKAGES > "$ERROR_LOG" 2>&1; then 
-        INSTALL_EXIT=1
-    else 
-        INSTALL_EXIT=0
-    fi
-fi
-
-# Handle installation failure
-if [ $INSTALL_EXIT -ne 0 ]; then
-    if [ "$VERBOSE_MODE" != "yes" ]; then exec 3>&-; kill $WHIPTAIL_PID 2>/dev/null; fi
+echo ">>> Installing packages..."
+echo "    $PACKAGES"
+echo ""
+if ! apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $PACKAGES; then
+    echo ""
     echo -e "\033[1;31mERROR: Package installation failed.\033[0m"
-    if [ "$VERBOSE_MODE" != "yes" ]; then echo "Error Log:"; cat "$ERROR_LOG"; fi
     exit 1
 fi
-update_progress 50 "Packages installed."
+echo ""
+echo ">>> Packages installed successfully."
+echo ""
 
 # ==============================================================================
 # SYSTEM CONFIGURATION
 # ==============================================================================
 
-update_progress 51 "Configuring system..."
+echo ">>> Configuring system..."
 
 # Set system timezone
 [ ! -z "$TIMEZONE" ] && timedatectl set-timezone "$TIMEZONE"
-
-# Configure SSH service
-if [ "$ENABLE_SSH" == "yes" ]; then
-    systemctl enable ssh >/dev/null 2>&1
-    systemctl start ssh >/dev/null 2>&1
-else
-    systemctl disable ssh >/dev/null 2>&1
-    systemctl stop ssh >/dev/null 2>&1
-fi
 
 # Configure scheduled reboot if enabled
 if [ "$REBOOT_SCHEDULE" != "Disabled" ] && [ ! -z "$REBOOT_TIME" ]; then
     CALENDAR_STR="*-*-* ${REBOOT_TIME}:00"
     [ "$REBOOT_SCHEDULE" == "Weekly" ] && CALENDAR_STR="Mon *-*-* ${REBOOT_TIME}:00"
-    
+
     # Create systemd service for reboot action
     cat > /etc/systemd/system/kiosk-reboot.service <<EOF
 [Unit]
@@ -683,14 +679,14 @@ fi
 
 # Force system to boot into graphical target (required for Wayland)
 systemctl set-default graphical.target >/dev/null 2>&1
-update_progress 65 "System configured."
+echo ""
 
 # ==============================================================================
 # KERNEL BOOT PARAMETERS
 # ==============================================================================
 # Configure boot parameters for display, silent boot, and HDMI behavior
 
-update_progress 66 "Configuring kernel..."
+echo ">>> Configuring kernel boot parameters..."
 
 # Remove any existing video parameters to start clean
 remove_cmdline_param "video=HDMI-A-1"
@@ -723,23 +719,23 @@ if [ -n "$SILENT_ARGS" ]; then
     done
 fi
 
-update_progress 75 "Kernel configured."
+echo ""
 
 # ==============================================================================
 # NETWORK OPTIMIZATION
 # ==============================================================================
 # Reload systemd to pick up any network-related changes
 
-update_progress 76 "Configuring network..."
+echo ">>> Reloading systemd..."
 systemctl daemon-reload
-update_progress 85 "Network configured."
+echo ""
 
 # ==============================================================================
 # WAYLAND COMPOSITOR & BROWSER CONFIGURATION
 # ==============================================================================
 # Configure labwc (Wayland compositor), kanshi (display manager), and Chromium
 
-update_progress 86 "Configuring Labwc & Chromium..."
+echo ">>> Configuring Labwc, Kanshi, and Chromium..."
 
 # Configure kanshi for display output management
 # Kanshi applies display settings (resolution, rotation) at compositor startup
@@ -778,14 +774,6 @@ cat >> "$USER_HOME/.config/labwc/rc.xml" <<EOF
 </labwc_config>
 EOF
 
-# Setup tmpfs cache for Chromium (RAM-based cache for speed and flash wear reduction)
-CACHE_DIR="/tmp/chromium-cache"
-if ! grep -q "/tmp/chromium-cache" /etc/fstab; then
-    echo "tmpfs /tmp/chromium-cache tmpfs nodev,nosuid,size=100M 0 0" >> /etc/fstab
-fi
-mkdir -p /tmp/chromium-cache
-mount /tmp/chromium-cache 2>/dev/null || true
-
 # Create labwc autostart script
 # This launches all required services when labwc starts
 cat > "$USER_HOME/.config/labwc/autostart" <<EOF
@@ -797,18 +785,25 @@ kanshi &
 # Trigger native cursor hiding (Win+H keybind)
 sleep 1 && wtype -M logo -k h -m logo &
 
-# Wait for network connectivity before launching browser
-# Timeout after 10 seconds to prevent indefinite hang
-timeout 10s bash -c 'until ping -c1 google.com &>/dev/null; do sleep 1; done'
+# Fix Chromium crash detection state to prevent "didn't shut down correctly" dialog
+# This modifies the Preferences file to mark the previous session as clean
+if [ -f ~/.config/chromium/Default/Preferences ]; then
+    sed -i 's/"exited_cleanly":false/"exited_cleanly":true/' ~/.config/chromium/Default/Preferences 2>/dev/null
+    sed -i 's/"exit_type":"Crashed"/"exit_type":"Normal"/' ~/.config/chromium/Default/Preferences 2>/dev/null
+fi
+
+# Wait for kanshi to apply display settings
+sleep 3
 
 # Launch Chromium in kiosk mode with extensive optimizations
+# /tmp is already tmpfs on Raspberry Pi OS, so cache is in RAM by default
 /usr/bin/chromium \\
     --autoplay-policy=no-user-gesture-required \\
     --kiosk "$KIOSK_URL" \\
     --start-fullscreen --start-maximized --fast --fast-start \\
     --no-sandbox --no-first-run --noerrdialogs \\
     --disable-translate --disable-notifications --disable-infobars --disable-pinch \\
-    --disable-features=TranslateUI --disk-cache-dir=$CACHE_DIR \\
+    --disable-features=TranslateUI --disk-cache-dir=/tmp/chromium-cache \\
     --ozone-platform=wayland \\
     --enable-features=OverlayScrollbar,CanvasOopRasterization,VaapiVideoDecoder \\
     --overscroll-history-navigation=0 --password-store=basic --force-dark-mode \\
@@ -822,17 +817,23 @@ chmod +x "$USER_HOME/.config/labwc/autostart"
 
 # Configure greetd for automatic login
 # greetd is a minimal display manager that auto-starts labwc as the user
+# Both initial and default session ensure auto-restart if session exits (kiosk mode)
 mkdir -p /etc/greetd
 cat > /etc/greetd/config.toml <<EOF
 [terminal]
 vt = 1
-[default_session]
-command = "labwc"
-user = "$REAL_USER"
+
 [initial_session]
 command = "labwc"
 user = "$REAL_USER"
+
+[default_session]
+command = "labwc"
+user = "$REAL_USER"
 EOF
+
+# Ensure greetd service is enabled
+systemctl enable greetd.service >/dev/null 2>&1
 
 # Configure automatic security updates if enabled
 if [ "$ENABLE_SECURITY" == "yes" ]; then
@@ -847,14 +848,15 @@ fi
 # Set proper ownership for all user configuration files
 chown -R "$REAL_USER:$REAL_USER" "$USER_HOME/.config"
 
-update_progress 100 "Installation complete!"
-finish_progress
-
-# Display completion message
-if [ "$VERBOSE_MODE" == "yes" ]; then
-    echo ">>> INSTALLATION COMPLETE. Please reboot to apply changes."
-else
-    msg "Installation Complete!\n\nPlease reboot your system to apply changes."
-fi
+echo ""
+echo "======================================================================"
+echo -e "\033[1;32m  INSTALLATION COMPLETE!\033[0m"
+echo "======================================================================"
+echo ""
+echo "Please reboot your system to apply all changes:"
+echo "  sudo reboot"
+echo ""
+echo "After reboot, the system will automatically start in kiosk mode."
+echo ""
 
 exit 0
